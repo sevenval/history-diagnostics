@@ -5,9 +5,8 @@ from scipy.stats import mannwhitneyu
 from .stats import MetricCDF
 from .log import logger
 
-
-class History:
-    """Container for metric history."""
+class Sample:
+    """Container for a metric sample."""
     def __init__(self, requests, request_dtype=None, beginning=None, end=None, is_sorted=False):
         """
         Parameters
@@ -27,17 +26,17 @@ class History:
         """
         if isinstance(requests, np.recarray):
             self.requests = requests
-            self.request_dtype = self.requests.dtype
         elif hasattr(requests, "to_records"):
             self.requests = requests.to_records(index=False)
-            self.request_dtype = self.requests.dtype
-
         else:
             if request_dtype is None:
                 raise ValueError("request_dtype must be specified!")
-            self.request_dtype = request_dtype
             self.requests = np.array(requests,
-                                     dtype=self.request_dtype).view(np.recarray)
+                                     dtype=request_dtype).view(np.recarray)
+
+        if "time" not in self.requests.dtype.names:
+            raise ValueError("requests or request_dtype must have a 'time' field!")
+
         if not is_sorted:
             self.requests.sort(order="time")
 
@@ -73,53 +72,75 @@ class History:
         """The duration of the history."""
         return self.end - self.beginning
 
-    def get_generator(self, interval_size, time_reshuffling=False):
-        """Generator to create sample histories from this one grouping intervals in interval_size."""
-        if time_reshuffling:
-            raise NotImplementedError("This is not implemented, but should not be important for A/a/b.")
-        n_intervals = int(self.duration / interval_size)
-        print(n_intervals)
-        prec_interval_size = self.duration / n_intervals
-        logger.info("Asked and possible interval sizes differ by {}".format(prec_interval_size / interval_size - 1))
+    def get_bootstrap_sample_generator(self, window_size):
+        """Generator for bootstrap samples with data grouped in intervals of `interval_size`.
 
-        if n_intervals not in self.sample_generators:
-            self.sample_generators[n_intervals] = self.make_sample_generator(prec_interval_size, n_intervals)
-        return self.sample_generators[n_intervals]
+        Parameters
+        ----------
+        interval_size : float
+            The targeted time window to group data into.
 
-    def make_sample_generator(self, prec_interval_size, n_intervals):
-        logger.info("Interval size: {} => {} intervals".format(prec_interval_size, n_intervals))
+        Returns
+        -------
+        gen : generator
+            Generator
+        """
+        n_windows = int(self.duration / window_size)
+        prec_window_size = self.duration / n_windows
+        logger.info("Asked and possible window sizes differ by {}".format(prec_window_size / window_size - 1))
+
+        if n_windows not in self.sample_generators:
+            self.sample_generators[n_windows] = self._make_sample_generator(prec_window_size, n_windows)
+        return self.sample_generators[n_windows]
+
+    def make_bs_sample_generator(self, prec_window_size, n_windows):
+        logger.info("window size: {} => {} windows".format(prec_window_size, n_windows))
 
         t = self.requests.time
-        # List of request indices contained in each interval.
-        intervals = []
+        # List of request indices contained in each window.
+        windows = []
         last_req_idx = 0
         num_requests = 0
         n_empty = 0
-        for i in range(1, n_intervals + 1):
-            i_included = np.searchsorted(t[last_req_idx:], self.beginning + i * prec_interval_size, "right")
+        for i in range(1, n_windows + 1):
+            i_included = np.searchsorted(t[last_req_idx:], self.beginning + i * prec_window_size, "right")
             indices = list(range(last_req_idx, last_req_idx+i_included))
-            intervals.append(indices)
+            windows.append(indices)
             num_requests += len(indices)
             last_req_idx += i_included
             if len(indices) == 0:
                 n_empty += 1
-        logger.info("Generated intervals ({} of {} empty) to sample from.".format(n_empty, n_intervals))
+        logger.info("Generated windows ({} of {} empty) to sample from.".format(n_empty, n_windows))
 
         assert num_requests == len(t)
-        assert len(intervals) == n_intervals
+        assert len(windows) == n_windows
 
         while True:
-            sampled_intervals = np.random.choice(n_intervals, n_intervals)
-            sampled_intervals.sort()
-            sampled_idx = chain.from_iterable(intervals[i] for i in sampled_intervals)
+            sampled_windows = np.random.choice(n_windows, n_windows)
+            sampled_windows.sort()
+            sampled_idx = chain.from_iterable(windows[i] for i in sampled_windows)
             request_gen = (self.requests[i] for i in sampled_idx)
-            sampled_requests = np.fromiter(request_gen, dtype=self.request_dtype)
+            sampled_requests = np.fromiter(request_gen, dtype=self.requests.dtype)
 
-            yield History(sampled_requests, self.request_dtype, self.beginning, self.end)
+            yield Sample(sampled_requests, self.requests.dtype, self.beginning, self.end)
 
-    def samples(self, n_samples, interval_size, time_reshuffling=False):
+    def samples(self, n_samples, window_size):
+        """Generate a list of bootstrap samples.
+
+        Parameters
+        ----------
+        n_samples : int
+            The number of samples to draw.
+        window_size : float
+            The target window size to group data into.
+
+        Returns
+        -------
+        samples : list of Sample objects
+            List of bootstrap samples drawn from this sample.
+        """
         samples = []
-        gen = self.get_generator(interval_size, time_reshuffling)
+        gen = self.get_bootstrap_sample_generator(window_size)
         logger.info("Starting sample generation")
         for i, h_i in zip(range(n_samples), gen):
             samples.append(h_i)
@@ -127,35 +148,54 @@ class History:
         return samples
 
     def split(self, where):
-        """Split the history into two sub-histories."""
+        """Split the sample into two sub-samples.
+
+        Parameters
+        ----------
+        where : float
+            The time where the sample is split.
+
+        Returns
+        -------
+        s1, s2 : Sample
+            The new sub-samples.
+        """
         if not self.beginning < where < self.end:
             raise ValueError("where outside of history")
 
         i = np.searchsorted(self.requests.time, where, "right")
-        h1 = History(self.requests[:i], self.request_dtype, self.beginning, where, True)
-        h2 = History(self.requests[i:], self.request_dtype, where, self.end, True)
-        return h1, h2
+        s1 = Sample(self.requests[:i], self.requests.dtype, self.beginning, where, True)
+        s2 = Sample(self.requests[i:], self.requests.dtype, where, self.end, True)
+        return s1, s2
 
-    def append(self, other):
-        if other.beginning < self.end:
-            raise ValueError("Histories overlap!")
+    def merge(self, other):
+        """Merge another sample in place.
+
+        Parameters
+        ----------
+        other : Sample
+        """
         self.requests = np.concatenate((self.requests, other.requests)).view(np.recarray)
-        self.end = other.end
+        self.beginning = min(self.beginning, other.beginning)
+        self.end = max(self.end, other.end)
         self.__min_distances.clear()
+        self.sample_generators.clear()
 
     @classmethod
-    def generate(cls, beginning, end, request_rate, **generators):
-        """Generate a request history.
+    def generate(cls, beginning, end, data_rate, **generators):
+        """Generate a sample.
 
         Parameters
         ----------
         beginning, end : float
+            The time interval this sample spans.
             See `__init__`.
-        request_rate : float
+        data_rate : float
+            The rate at which data occurs.
         kwargs :
             Definitions of random generators.
         """
-        n_requests = int((end - beginning) * request_rate)
+        n_requests = int((end - beginning) * data_rate)
         times = beginning + (end - beginning) * np.random.rand(n_requests)
         times.sort()
         dtypes = [("time", float)]
@@ -205,9 +245,8 @@ def metric_ranges(*ranges):
     return decorator
 
 
-
 class TargetSpace:
-    def __init__(self, metric_estimator, conf_levels=(0.95, 0.99), cdf_type=None):
+    def __init__(self, metric_estimator, cdf_type=None):
         """
         Parameters
         ----------
@@ -215,16 +254,12 @@ class TargetSpace:
             Called to calculate metric values from a `History` object. Can
             have `ranges` and `directions` attributes which are used to
             contruct CDFs (see e.g. :class:`~targetspace.stats.MetricCDF`).
-        conf_levels : pair of floats
-            The confidence levels of the borderes between acceptable,
-            tolerating and frustrating regions of the target space.
         cdf_cls : class, optional
             The CDF implementation. See :module:`targetspace/stats.py` for
             implementations. Defaults to
             :class:`~targetspace.stats.MetricCDF`.
         """
         self.metric_estimator = metric_estimator
-        self.conf_levels = conf_levels
         if cdf_type is None:
             self.cdf_type = MetricCDF
         else:
@@ -246,7 +281,8 @@ class TargetSpace:
 
         Parameters
         ----------
-        history : History
+        history : Sample
+            The pre-experiment sample.
         n_bs_samples : int
             The number of bootstrap samples used for dynamic baselining.
         bs_interval_size : float or None, optional
@@ -345,7 +381,6 @@ class MWTargetSpace(TargetSpace):
         for ref, test in zip(self._references, metrics):
             evaluated.append(mannwhitneyu(ref, test).pvalue)
         return self.combine_evaluated_metrics(np.asarray(evaluated))
-
 
 
 class MinMixin:
