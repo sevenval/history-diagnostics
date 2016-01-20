@@ -1,9 +1,28 @@
-from itertools import chain
+from itertools import chain, islice
 import numpy as np
 from scipy.stats import mannwhitneyu
 
 from .stats import MetricCDF
 from .log import logger
+
+
+class SampleGenerator:
+    def __init__(self, sample, windows):
+        self.sample = sample
+        self.windows = windows
+
+    def __call__(self, ratio=1.0):
+        n_windows = len(self.windows)
+        n_output = int(ratio * n_windows)
+
+        while True:
+            sampled_windows = np.random.choice(n_windows, n_output)
+            sampled_windows.sort()
+            sampled_idx = chain.from_iterable(self.windows[i] for i in sampled_windows)
+            request_gen = (self.sample.requests[i] for i in sampled_idx)
+            sampled_requests = np.fromiter(request_gen, dtype=self.sample.requests.dtype).view(np.recarray)
+
+            yield Sample(sampled_requests, beginning=self.sample.beginning, end=self.sample.end)
 
 class Sample:
     """Container for a metric sample."""
@@ -72,7 +91,7 @@ class Sample:
         """The duration of the history."""
         return self.end - self.beginning
 
-    def get_bootstrap_sample_generator(self, window_size):
+    def get_bootstrap_sample_generator(self, window_size, ratio):
         """Generator for bootstrap samples with data grouped in intervals of `interval_size`.
 
         Parameters
@@ -90,8 +109,8 @@ class Sample:
         logger.info("Asked and possible window sizes differ by {}".format(prec_window_size / window_size - 1))
 
         if n_windows not in self.sample_generators:
-            self.sample_generators[n_windows] = self._make_sample_generator(prec_window_size, n_windows)
-        return self.sample_generators[n_windows]
+            self.sample_generators[n_windows] = self.make_bs_sample_generator(prec_window_size, n_windows)
+        return self.sample_generators[n_windows](ratio)
 
     def make_bs_sample_generator(self, prec_window_size, n_windows):
         logger.info("window size: {} => {} windows".format(prec_window_size, n_windows))
@@ -115,16 +134,18 @@ class Sample:
         assert num_requests == len(t)
         assert len(windows) == n_windows
 
-        while True:
-            sampled_windows = np.random.choice(n_windows, n_windows)
-            sampled_windows.sort()
-            sampled_idx = chain.from_iterable(windows[i] for i in sampled_windows)
-            request_gen = (self.requests[i] for i in sampled_idx)
-            sampled_requests = np.fromiter(request_gen, dtype=self.requests.dtype)
+        return SampleGenerator(self, windows)
 
-            yield Sample(sampled_requests, self.requests.dtype, self.beginning, self.end)
+        # while True:
+            # sampled_windows = np.random.choice(n_windows, n_windows)
+            # sampled_windows.sort()
+            # sampled_idx = chain.from_iterable(windows[i] for i in sampled_windows)
+            # request_gen = (self.requests[i] for i in sampled_idx)
+            # sampled_requests = np.fromiter(request_gen, dtype=self.requests.dtype)
 
-    def samples(self, n_samples, window_size):
+            # yield Sample(sampled_requests, self.requests.dtype, self.beginning, self.end)
+
+    def samples(self, n_samples, window_size, ratio):
         """Generate a list of bootstrap samples.
 
         Parameters
@@ -133,17 +154,17 @@ class Sample:
             The number of samples to draw.
         window_size : float
             The target window size to group data into.
+        ratio : float
+            The ratio of requests, that the samples should contain.
 
         Returns
         -------
         samples : list of Sample objects
             List of bootstrap samples drawn from this sample.
         """
-        samples = []
-        gen = self.get_bootstrap_sample_generator(window_size)
+        gen = self.get_bootstrap_sample_generator(window_size, ratio)
         logger.info("Starting sample generation")
-        for i, h_i in zip(range(n_samples), gen):
-            samples.append(h_i)
+        samples = [s for _, s in zip(range(n_samples), gen)]
         logger.info("Finished sample generation")
         return samples
 
@@ -246,7 +267,7 @@ def metric_ranges(*ranges):
 
 
 class TargetSpace:
-    def __init__(self, metric_estimator, cdf_type=None):
+    def __init__(self, metric_estimator, history, cdf_type=None):
         """
         Parameters
         ----------
@@ -265,44 +286,58 @@ class TargetSpace:
         else:
             self.cdf_type = cdf_type
 
+        self.history = history
+
         #: The bootstrap CDFs for the metrics.
-        self._bs_metric_cdfs = None
+        self._bs_metric_cdfs = {}
         self.combine_max_idx = []
 
     def combine_evaluated_metrics(self, evaluated):
         raise NotImplementedError()
 
-    def evaluate_observed_metrics(self, metrics):
-        return np.fromiter((cdf(m) for (cdf, m) in zip(self._bs_metric_cdfs, metrics)),
-                           dtype=float)
-
-    def calibrate(self, history, n_bs_samples, bs_interval_size=None):
+    def calibrate(self, ratio, n_bs_samples, bs_window_size, recalibrate=False):
         """Calibrate the target space via dynamic base lining.
 
         Parameters
         ----------
-        history : Sample
-            The pre-experiment sample.
+        ratio : float
+            The duration ratio to calibrate for.
         n_bs_samples : int
             The number of bootstrap samples used for dynamic baselining.
-        bs_interval_size : float or None, optional
-            The time interval to generate bootstrap samples from `history`.
-            Defaults to `None`, i.e. `0.5 * history.min_interval(1)`,
-            asserting that each sample time interval contains at most 1 data
-            point. See `History.min_interval()`.
+        bs_window_size : float
+            The time window to generate bootstrap samples from `self.history`.
+        recalibrate : bool, optional
         """
-        logger.info("Calibrating: generating samples")
-        if bs_interval_size is None:
-            bs_interval_size = history.min_interval(1) * 0.5
-        samples = history.samples(n_bs_samples, bs_interval_size)
-        self._calibrate_with_samples(samples)
+        if ratio in self._bs_metric_cdfs:
+            if not recalibrate:
+                logger.warn("Target space for {!r} already calibrated".format(ratio))
+                return
 
-    def locate(self, history, n_bs_samples=0, bs_interval_size=None, cls=(0.9,)):
-        """Locate history in the calibrated target space.
+        logger.info("Calibrating for {!r}: generating samples".format(ratio))
+        samples = self.history.samples(n_bs_samples, bs_window_size, ratio)
+        logger.info("Calibrating for {!r}: estimating metrics".format(ratio))
+
+        metric_bs_data = tuple(np.empty(n_bs_samples) for _ in range(len(self.metric_estimator.directions)))
+
+        for i, s in enumerate(samples):
+            metrics = self.metric_estimator(s)
+            for j, m in enumerate(metrics):
+                metric_bs_data[j][i] = m
+
+        md_dir_range = zip(metric_bs_data, self.metric_estimator.directions, self.metric_estimator.ranges)
+        self._bs_metric_cdfs[ratio] = tuple(self.cdf_type(md, d, r) for md, d, r in md_dir_range)
+
+    def get_cdfs(self, ratio):
+        if ratio not in self._bs_metric_cdfs:
+            raise RuntimeError("Target space not calibrated for duration ratio {!r}".format(ratio))
+        return self._bs_metric_cdfs[ratio]
+
+    def locate(self, sample, n_bs_samples=0, bs_interval_size=None, cls=(0.9,)):
+        """Locate sample in the calibrated target space.
 
         Parameters
         ----------
-        history : History
+        sample : Sample
         n_bs_samples : int, optional
             If `>0` use bootstraping to estimate confidence intervals.
         bs_interval_size : float or None, optional
@@ -323,15 +358,16 @@ class TargetSpace:
             lower_limit, upper_limit)` triplets.
         """
         self.combine_max_idx = []
-        if n_bs_samples: 
-            samples = history.samples(n_bs_samples, bs_interval_size)
+        if n_bs_samples:
+            bs_samples = sample.samples(n_bs_samples, bs_interval_size, sample.duration / self.history.duration)
         else:
-            samples = []
-        return self._locate_with_samples(history, samples)
+            bs_samples = []
+        return self._locate_with_bs_samples(sample, bs_samples)
 
-    def _locate_with_samples(self, history, samples, cls=(0.9,)):
-        location = self._locate_history(history)
-        locations = np.asarray([self._locate_history(s) for s in samples])
+    def _locate_with_bs_samples(self, sample, bs_samples, cls=(0.9,)):
+        ratio = sample.duration / self.history.duration
+        location = self._locate_sample(sample, ratio)
+        locations = np.asarray([self._locate_sample(s) for s in bs_samples])
         if locations.size == 0:
             return location
 
@@ -342,11 +378,12 @@ class TargetSpace:
             limits.append((cl, ll, ul))
         return location, limits
 
-    def _locate_history(self, history):
-        if self._bs_metric_cdfs is None:
-            raise RuntimeError("Target space not calibrated!")
-        metrics = self.metric_estimator(history)
-        evaluated = self.evaluate_observed_metrics(metrics)
+    def _locate_sample(self, sample, ratio):
+        cdfs = self.get_cdfs(ratio)
+
+        metrics = self.metric_estimator(sample)
+        evaluated = np.fromiter((cdf(m) for (cdf, m) in zip(cdfs, metrics)),
+                                dtype=float)
         combined = self.combine_evaluated_metrics(evaluated)
         logger.debug("Located history  metrics: {}".format(metrics))
         logger.debug("Located history  evaluated: {}".format(evaluated))
@@ -354,28 +391,12 @@ class TargetSpace:
 
         return combined
 
-    def _calibrate_with_samples(self, samples):
-        if self._bs_metric_cdfs is not None:
-            raise RuntimeError("Target space already calibrated!")
-
-        n_samples = len(samples)
-
-        metric_bs_data = tuple(np.empty(n_samples) for _ in range(len(self.metric_estimator.directions)))
-
-        for i, s in enumerate(samples):
-            metrics = self.metric_estimator(s)
-            for j, m in enumerate(metrics):
-                metric_bs_data[j][i] = m
-
-        md_dir_range = zip(metric_bs_data, self.metric_estimator.directions, self.metric_estimator.ranges)
-        self._bs_metric_cdfs = tuple(self.cdf_type(md, d, r) for md, d, r in md_dir_range)
-
 
 class MWTargetSpace(TargetSpace):
     def calibrate(self, history, *_):
         self._references = self.metric_estimator(history)
 
-    def _locate_history(self, history, *_):
+    def _locate_sample(self, history, *_):
         metrics = self.metric_estimator(history)
         evaluated = []
         for ref, test in zip(self._references, metrics):
@@ -392,7 +413,6 @@ class OneMinusMaxMixin:
     def combine_evaluated_metrics(self, evaluated):
         self.combine_max_idx.append(evaluated.argmax())
         return 1.0 - evaluated.max()
-
 
 class GeometricMeanMixin:
     def combine_evaluated_metrics(self, evaluated):

@@ -3,7 +3,7 @@ import numpy as np
 from .log import logger
 
 class MetricCDF:
-    """Empirical CDF for the probalility to find worse values for a metric."""
+    """Empirical CDF for the probability to find better values for a metric."""
     def __init__(self, sample, direction="upper", value_range=(None, None)):
         """
         Parameters
@@ -38,18 +38,12 @@ class MetricCDF:
         else:
             i = np.searchsorted(self.sample, x, side="left")
 
-        if i == 0 and x < self.sample[0]:
-            if self.value_range[0] is not None:
-                logger.debug("Interpolating lower-tail cdf")
-                i = (x - self.value_range[0]) / (self.sample[0] - self.value_range[0])
-            # else:
-                # i = 1
-        elif i == len(self.sample) and x > self.sample[-1]:
-            if self.value_range[1] is not None:
-                logger.debug("Interpolating upper-tail cdf")
-                i = i - 1 + (self.value_range[1] - x) / (self.value_range[1] - self.sample[-1])
-            # else:
-                # i = len(self.sample) - 1
+        if i == 0 and x < self.sample[0] and self.value_range[0] is not None:
+            logger.debug("Interpolating lower-tail cdf")
+            i = (x - self.value_range[0]) / (self.sample[0] - self.value_range[0])
+        elif i == len(self.sample) and x > self.sample[-1] and self.value_range[1] is not None:
+            logger.debug("Interpolating upper-tail cdf")
+            i = i - 1 + (self.value_range[1] - x) / (self.value_range[1] - self.sample[-1])
         return i
 
 

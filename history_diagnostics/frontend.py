@@ -1,7 +1,7 @@
 import numpy as np
 from scipy import stats
 
-from .targetspace import metric_directions, metric_ranges, History, TargetSpace, OneMinusMaxMixin, MinMixin, MWTargetSpace
+from .targetspace import metric_directions, metric_ranges, Sample, TargetSpace, OneMinusMaxMixin, MinMixin, MWTargetSpace
 
 @metric_directions("upper", "lower", "lower", "upper")
 @metric_ranges((0, None), (0, None), (0, 1), (0, 1))
@@ -26,29 +26,33 @@ def mw_frontend_metrics(history):
 
 
 class FrontendTargetSpace(OneMinusMaxMixin, TargetSpace):
-    def __init__(self):
-        super().__init__(frontend_metrics, (0.90, 0.95))
+    def __init__(self, history):
+        super().__init__(frontend_metrics, history)
+
 
 class FrontendMWTargetSpace(MinMixin, MWTargetSpace):
     def __init__(self):
-        super().__init__(mw_frontend_metrics, (0.90, 0.95))
+        super().__init__(mw_frontend_metrics)
 
 
 def example():
     # Generate a history between t=0 and 1, 1000 requests, a
     # positive-constrained normal performace distribution and 
-    history = History.generate(0, 1, 1000,
-                               performance=(float, lambda times: np.abs(stats.norm.rvs(4.5, 1.0, size=times.size))),
-                               faulty=(bool, lambda times: stats.binom.rvs(1, 0.05, size=times.size)),
-                               event=(bool, lambda times: stats.binom.rvs(1, 0.15, size=times.size)))
+    history = Sample.generate(0, 1, 10000,
+                              performance=(float, lambda times: np.abs(stats.norm.rvs(loc=4.5, scale=0.87, size=times.size))),
+                              faulty=(bool, lambda times: stats.binom.rvs(1, 0.05, size=times.size)),
+                              event=(bool, lambda times: stats.binom.rvs(1, 0.15, size=times.size)))
     h_T, h_C = history.split(0.8)
+    ratio = h_C.duration / h_T.duration
+    # print(ratio)
 
-    class TS(OneMinusMaxMixin, TargetSpace):
-        pass
-
-    ts = FrontendTargetSpace()
-    print("Calibrating")
-    ts.calibrate(h_T, 20, 1e-5)
-    print("Locating")
-    print(ts.locate(h_C, 20, 1e-5))
-    return ts, h_T, h_C
+    ts = FrontendTargetSpace(h_T)
+    # print("Calibrating")
+    ts.calibrate(ratio, 100, 1e-4)
+    # print(ts.metric_estimator(h_T))
+    # print(ts.metric_estimator(h_C))
+    # print(ts.evaluate_observed_metrics(ts.metric_estimator(h_C)))
+    # print("Locating")
+    # print(ts.locate(h_C, 100, 1e-4))
+    print(ts.locate(h_C))
+    # return ts, h_T, h_C
