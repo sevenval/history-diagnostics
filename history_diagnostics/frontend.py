@@ -11,16 +11,16 @@ def frontend_metrics(history):
     traffic = n_requests / history.duration
     perf = np.median(history.requests.performance)
 
-    error_rate = history.requests.faulty.sum() / n_requests
-    event_rate = history.requests.event.sum() / n_requests
+    error_rate = history.requests.js_error.sum() / n_requests
+    event_rate = history.requests.event1.sum() / n_requests
 
     return traffic, perf, error_rate, event_rate
 
 def mw_frontend_metrics(history):
     traffic = np.diff(history.requests.time)
     perf = history.requests.performance
-    errors = np.diff(history.requests.time[history.requests.faulty])
-    events = np.diff(history.requests.time[history.requests.event])
+    errors = np.diff(history.requests.time[history.requests.js_error])
+    events = np.diff(history.requests.time[history.requests.event1])
 
     return traffic, perf, errors, events
 
@@ -40,8 +40,8 @@ def example():
     # positive-constrained normal performace distribution and 
     history = Sample.generate(0, 1, 10000,
                               performance=(float, lambda times: np.abs(stats.norm.rvs(loc=4.5, scale=0.87, size=times.size))),
-                              faulty=(bool, lambda times: stats.binom.rvs(1, 0.05, size=times.size)),
-                              event=(bool, lambda times: stats.binom.rvs(1, 0.15, size=times.size)))
+                              js_error=(bool, lambda times: stats.binom.rvs(1, 0.05, size=times.size)),
+                              event1=(bool, lambda times: stats.binom.rvs(1, 0.15, size=times.size)))
     h_T, h_C = history.split(0.8)
     ratio = h_C.duration / h_T.duration
     # print(ratio)

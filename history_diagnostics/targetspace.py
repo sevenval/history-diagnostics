@@ -1,4 +1,4 @@
-from itertools import chain, islice
+from itertools import chain
 import numpy as np
 from scipy.stats import mannwhitneyu
 
@@ -11,22 +11,24 @@ class SampleGenerator:
         self.sample = sample
         self.windows = windows
 
-    def __call__(self, ratio=1.0):
+    def __call__(self, duration_ratio=1.0, traffic_ratio=1.0):
         n_windows = len(self.windows)
-        n_output = int(ratio * n_windows)
+        n_output = int(duration_ratio * n_windows)
 
         while True:
             sampled_windows = np.random.choice(n_windows, n_output)
             sampled_windows.sort()
             sampled_idx = chain.from_iterable(self.windows[i] for i in sampled_windows)
-            request_gen = (self.sample.requests[i] for i in sampled_idx)
-            sampled_requests = np.fromiter(request_gen, dtype=self.sample.requests.dtype).view(np.recarray)
+            requests_gen = (self.sample.requests[i] for i in sampled_idx)
+            sampled_requests = np.fromiter(requests_gen, dtype=self.sample.requests.dtype).view(np.recarray)
 
-            yield Sample(sampled_requests, beginning=self.sample.beginning, end=self.sample.end)
+            s = Sample(sampled_requests, beginning=self.sample.beginning, end=self.sample.end, traffic_boost=1/traffic_ratio)
+            yield s
+
 
 class Sample:
     """Container for a metric sample."""
-    def __init__(self, requests, request_dtype=None, beginning=None, end=None, is_sorted=False):
+    def __init__(self, requests, request_dtype=None, beginning=None, end=None, is_sorted=False, traffic_boost=1.0):
         """
         Parameters
         ----------
@@ -66,9 +68,13 @@ class Sample:
 
         self.beginning = beginning
         self.end = end
+        self.traffic_boost=1.0
 
         self.__min_distances = {}
         self.sample_generators = {}
+
+    def __len__(self):
+        return len(self.requests)
 
     def min_interval(self, n_contained):
         """The minimal interval size containing `n_contained` requests.
@@ -185,8 +191,8 @@ class Sample:
             raise ValueError("where outside of history")
 
         i = np.searchsorted(self.requests.time, where, "right")
-        s1 = Sample(self.requests[:i], self.requests.dtype, self.beginning, where, True)
-        s2 = Sample(self.requests[i:], self.requests.dtype, where, self.end, True)
+        s1 = Sample(self.requests[:i], self.requests.dtype, self.beginning, where, True, self.traffic_boost)
+        s2 = Sample(self.requests[i:], self.requests.dtype, where, self.end, True, self.traffic_boost)
         return s1, s2
 
     def merge(self, other):
@@ -290,17 +296,16 @@ class TargetSpace:
 
         #: The bootstrap CDFs for the metrics.
         self._bs_metric_cdfs = {}
-        self.combine_max_idx = []
 
     def combine_evaluated_metrics(self, evaluated):
         raise NotImplementedError()
 
-    def calibrate(self, ratio, n_bs_samples, bs_window_size, recalibrate=False):
+    def calibrate(self, duration_ratio, n_bs_samples, bs_window_size, recalibrate=False):
         """Calibrate the target space via dynamic base lining.
 
         Parameters
         ----------
-        ratio : float
+        duration_ratio : float
             The duration ratio to calibrate for.
         n_bs_samples : int
             The number of bootstrap samples used for dynamic baselining.
@@ -308,14 +313,14 @@ class TargetSpace:
             The time window to generate bootstrap samples from `self.history`.
         recalibrate : bool, optional
         """
-        if ratio in self._bs_metric_cdfs:
+        if duration_ratio in self._bs_metric_cdfs:
             if not recalibrate:
-                logger.warn("Target space for {!r} already calibrated".format(ratio))
+                logger.warn("Target space for {!r} already calibrated".format(duration_ratio))
                 return
 
-        logger.info("Calibrating for {!r}: generating samples".format(ratio))
-        samples = self.history.samples(n_bs_samples, bs_window_size, ratio)
-        logger.info("Calibrating for {!r}: estimating metrics".format(ratio))
+        logger.info("Calibrating for {!r}: generating samples".format(duration_ratio))
+        samples = self.history.samples(n_bs_samples, bs_window_size, duration_ratio)
+        logger.info("Calibrating for {!r}: estimating metrics".format(duration_ratio))
 
         metric_bs_data = tuple(np.empty(n_bs_samples) for _ in range(len(self.metric_estimator.directions)))
 
@@ -325,14 +330,14 @@ class TargetSpace:
                 metric_bs_data[j][i] = m
 
         md_dir_range = zip(metric_bs_data, self.metric_estimator.directions, self.metric_estimator.ranges)
-        self._bs_metric_cdfs[ratio] = tuple(self.cdf_type(md, d, r) for md, d, r in md_dir_range)
+        self._bs_metric_cdfs[duration_ratio] = tuple(self.cdf_type(md, d, r) for md, d, r in md_dir_range)
 
-    def get_cdfs(self, ratio):
-        if ratio not in self._bs_metric_cdfs:
-            raise RuntimeError("Target space not calibrated for duration ratio {!r}".format(ratio))
-        return self._bs_metric_cdfs[ratio]
+    def get_cdfs(self, duration_ratio):
+        if duration_ratio not in self._bs_metric_cdfs:
+            raise RuntimeError("Target space not calibrated for duration ratio {!r}".format(duration_ratio))
+        return self._bs_metric_cdfs[duration_ratio]
 
-    def locate(self, sample, n_bs_samples=0, bs_interval_size=None, cls=(0.9,)):
+    def locate(self, sample, traffic_ratio=1, n_bs_samples=0, bs_interval_size=None, cls=(0.9,)):
         """Locate sample in the calibrated target space.
 
         Parameters
@@ -357,17 +362,16 @@ class TargetSpace:
             associated lower and upper interval limits as `(conf_level,
             lower_limit, upper_limit)` triplets.
         """
-        self.combine_max_idx = []
         if n_bs_samples:
             bs_samples = sample.samples(n_bs_samples, bs_interval_size, sample.duration / self.history.duration)
         else:
             bs_samples = []
-        return self._locate_with_bs_samples(sample, bs_samples)
+        return self._locate_with_bs_samples(sample, bs_samples, cls, traffic_ratio)
 
-    def _locate_with_bs_samples(self, sample, bs_samples, cls=(0.9,)):
-        ratio = sample.duration / self.history.duration
-        location = self._locate_sample(sample, ratio)
-        locations = np.asarray([self._locate_sample(s) for s in bs_samples])
+    def _locate_with_bs_samples(self, sample, bs_samples, cls, traffic_ratio):
+        duration_ratio = sample.duration / self.history.duration
+        location = self._locate_sample(sample, duration_ratio, traffic_ratio)
+        locations = np.asarray([self._locate_sample(s, duration_ratio, traffic_ratio) for s in bs_samples])
         if locations.size == 0:
             return location
 
@@ -378,8 +382,8 @@ class TargetSpace:
             limits.append((cl, ll, ul))
         return location, limits
 
-    def _locate_sample(self, sample, ratio):
-        cdfs = self.get_cdfs(ratio)
+    def _locate_sample(self, sample, duration_ratio, traffic_ratio):
+        cdfs = self.get_cdfs(duration_ratio)
 
         metrics = self.metric_estimator(sample)
         evaluated = np.fromiter((cdf(m) for (cdf, m) in zip(cdfs, metrics)),
@@ -411,7 +415,6 @@ class MinMixin:
 
 class OneMinusMaxMixin:
     def combine_evaluated_metrics(self, evaluated):
-        self.combine_max_idx.append(evaluated.argmax())
         return 1.0 - evaluated.max()
 
 class GeometricMeanMixin:
