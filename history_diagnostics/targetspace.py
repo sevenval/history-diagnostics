@@ -7,16 +7,50 @@ from .log import logger
 
 
 class SampleGenerator:
-    def __init__(self, sample, windows):
+    """Draw bootstrap samples from a request time series.
+
+    Necessary inputs:
+
+    sample : Sample
+    windows : list
+        List with indices contained in time-windows.
+    n_empty : int
+        The number of empty windows.
+
+    A sample is drawn by
+
+    * determine the number of non-emtpy windows to draw, `n_sample`, by
+      drawing from a binomial distribution with number of trials given by
+      the total number of windows (empty and full) scaled by the duration
+      ratio,
+
+      .. math::
+
+          n_{trials} = r_{duration} * N_{windows}
+                     = `duration_ratio * (len(windows) + self.n_empty)`
+
+      and the probability to hit a non-empty window
+
+      .. math::
+
+          P = N_{full windows} / N_{windows}
+            = `len(windows) /  (len(windows) + self.n_empty)`
+
+
+    * draw `n_sample` windows from `self.windows`, sort and pull the request data from `self.sample.reqests`.
+    """
+    def __init__(self, sample, windows, n_empty):
         self.sample = sample
         self.windows = windows
+        self.n_empty = n_empty
 
     def __call__(self, duration_ratio=1.0, traffic_ratio=1.0):
         n_windows = len(self.windows)
-        n_output = int(duration_ratio * n_windows)
+        n_output = int(duration_ratio * (n_windows + self.n_empty))
 
         while True:
-            sampled_windows = np.random.choice(n_windows, n_output)
+            n_sample = np.random.binomial(n_output, n_windows / (n_windows + self.n_empty))
+            sampled_windows = np.random.choice(n_windows, n_sample)
             sampled_windows.sort()
             sampled_idx = chain.from_iterable(self.windows[i] for i in sampled_windows)
             requests_gen = (self.sample.requests[i] for i in sampled_idx)
@@ -115,41 +149,28 @@ class Sample:
         logger.info("Asked and possible window sizes differ by {}".format(prec_window_size / window_size - 1))
 
         if n_windows not in self.sample_generators:
-            self.sample_generators[n_windows] = self.make_bs_sample_generator(prec_window_size, n_windows)
+            windows, n_empty = self.get_windows(prec_window_size, n_windows)
+            self.sample_generators[n_windows] = SampleGenerator(self, windows, n_empty)
         return self.sample_generators[n_windows](ratio)
 
-    def make_bs_sample_generator(self, prec_window_size, n_windows):
-        logger.info("window size: {} => {} windows".format(prec_window_size, n_windows))
-
+    def get_windows(self, prec_window_size, n_windows):
         t = self.requests.time
-        # List of request indices contained in each window.
         windows = []
-        last_req_idx = 0
+        idx_last = 0
         num_requests = 0
         n_empty = 0
-        for i in range(1, n_windows + 1):
-            i_included = np.searchsorted(t[last_req_idx:], self.beginning + i * prec_window_size, "right")
-            indices = list(range(last_req_idx, last_req_idx+i_included))
-            windows.append(indices)
-            num_requests += len(indices)
-            last_req_idx += i_included
-            if len(indices) == 0:
+        for i_window in range(1, n_windows + 1):
+            idx_included = np.searchsorted(t[idx_last:] , t[0] + i_window * prec_window_size, "right")
+            if idx_included == 0:
                 n_empty += 1
-        logger.info("Generated windows ({} of {} empty) to sample from.".format(n_empty, n_windows))
-
+            else:
+                windows.append(np.arange(idx_last, idx_last + idx_included))
+                idx_last += idx_included
+                num_requests += len(windows[-1])
         assert num_requests == len(t)
-        assert len(windows) == n_windows
+        assert n_windows == len(windows) + n_empty
 
-        return SampleGenerator(self, windows)
-
-        # while True:
-            # sampled_windows = np.random.choice(n_windows, n_windows)
-            # sampled_windows.sort()
-            # sampled_idx = chain.from_iterable(windows[i] for i in sampled_windows)
-            # request_gen = (self.requests[i] for i in sampled_idx)
-            # sampled_requests = np.fromiter(request_gen, dtype=self.requests.dtype)
-
-            # yield Sample(sampled_requests, self.requests.dtype, self.beginning, self.end)
+        return windows, n_empty
 
     def samples(self, n_samples, window_size, ratio):
         """Generate a list of bootstrap samples.
