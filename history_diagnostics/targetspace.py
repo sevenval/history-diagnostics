@@ -6,6 +6,46 @@ from .stats import MetricCDF
 from .log import logger
 
 
+def group_indices(sarr, window_size=None, start=None):
+    """Get list with indices of entries of sorted `sarr` grouped in windows.
+    Parameters
+    ----------
+    sarr : ndarray
+        Sorted array.
+    window_size : float, optional
+        The window size (optional).
+    start : float, optional
+        The start of the first window. If omitted, `sarr[0]` is used.
+    Returns
+    -------
+    window_size : float
+        The used window size.
+    group : list of ndarrays
+        The groups of windowed indices pointing to `sarr`.
+    Examples
+    --------
+    >>> sarr = np.asarray([0, 0, 1, 1.5, 2, 3, 3.1])
+    >>> group_indices(sarr, 1)
+    1, [array([0, 1]), array([2, 3]), array([4]), array([5, 6])]
+    """
+    if start is None:
+        start = sarr[0]
+    if window_size is None:
+        window_size = (sarr[-1] - start) / sarr.size
+
+    window_idx = ((sarr - start) / window_size).astype(int)
+    first_idx = np.unique(window_idx, return_index=True)[1]
+    groups = []
+    for i, j in enumerate(first_idx):
+        if i < len(first_idx) - 1:
+            end = first_idx[i+1]
+        else:
+            end = len(window_idx)
+        groups.append(np.arange(j, end))
+
+    return window_size, groups
+
+
 class SampleGenerator:
     """Draw bootstrap samples from a request time series.
 
@@ -154,23 +194,8 @@ class Sample:
         return self.sample_generators[n_windows](ratio)
 
     def get_windows(self, prec_window_size, n_windows):
-        t = self.requests.time
-        windows = []
-        idx_last = 0
-        num_requests = 0
-        n_empty = 0
-        for i_window in range(1, n_windows + 1):
-            idx_included = np.searchsorted(t[idx_last:] , t[0] + i_window * prec_window_size, "right")
-            if idx_included == 0:
-                n_empty += 1
-            else:
-                windows.append(np.arange(idx_last, idx_last + idx_included))
-                idx_last += idx_included
-                num_requests += len(windows[-1])
-        assert num_requests == len(t)
-        assert n_windows == len(windows) + n_empty
-
-        return windows, n_empty
+        groups = group_indices(self.requests.time, prec_window_size, self.beginning)
+        return groups, n_windows - len(groups)
 
     def samples(self, n_samples, window_size, ratio):
         """Generate a list of bootstrap samples.
