@@ -2,7 +2,11 @@
 
 `history_diagnostics` is a pure-Python3 package to validate A/B tests.
 
-A tutorial is available [here](http://nbviewer.jupyter.org/github/sevenval/history-diagnostics/blob/development/tutorial.ipynb).
+## WWW 2016 DevDay
+
+The [WWW 2016 DevDay
+tutorial](http://nbviewer.jupyter.org/github/sevenval/history-diagnostics/blob/development/tutorial.ipynb)
+and [slides](docs/WWW2016DevDay.pdf) are available.
 
 ## Installation
 
@@ -11,7 +15,6 @@ A tutorial is available [here](http://nbviewer.jupyter.org/github/sevenval/histo
 Only `numpy` and `scipy` are required. `pandas` is recommended to ease up I/O.
 
 The versions shipped by/for your OS should suffice.
-
 
 ### Install `history_diagnostics`
 
