@@ -24,6 +24,7 @@ class MetricCDF:
         self.direction = direction
         self.value_range = value_range
 
+
     def __call__(self, x):
         """Calculate probabiltiy to find a metric value equal to or better than `x`.
 
@@ -35,7 +36,7 @@ class MetricCDF:
         Return
         ------
         prob : float
-            The probability to find a metric equal to or better than `x`.
+            The probability to find a metric better than `x`.
         """
         i = self.index(x)
         lower_tail = i / len(self.sample)
@@ -67,3 +68,25 @@ class InterpolatingMetricCDF(MetricCDF):
             logger.debug("Interpolating CDF")
             i += (x - self.sample[i-1]) / (self.sample[i] - self.sample[i-1])
         return i
+
+
+def percentile_weighted(a, q, weights=None, sorted_data=False):
+    if weights is None:
+        return np.percentile(a, q)
+
+    a = np.asanyarray(a)
+    weights = np.asanyarray(weights)
+
+    if a.shape != weights.shape:
+        raise ValueError("shape mismatch: a: {!r}  weights: {!r}".format(a.shape, weights.shape))
+
+    assert np.all(weights >= 0), "All weights must be >=0"
+
+    if not sorted_data:
+        idx = a.argsort()
+        a = a[idx]
+        weights = weights[idx]
+
+    cum_weights = weights.cumsum()
+
+    return np.interp(cum_weights[0] + q * 0.01 * (cum_weights[-1] - cum_weights[0]), cum_weights, a)

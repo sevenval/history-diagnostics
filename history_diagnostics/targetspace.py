@@ -89,14 +89,18 @@ class SampleGenerator:
         n_output = int(duration_ratio * (n_windows + self.n_empty))
 
         while True:
+            # Number of windows to draw.
             n_sample = np.random.binomial(n_output, n_windows / (n_windows + self.n_empty))
             sampled_windows = np.random.choice(n_windows, n_sample)
-            sampled_windows.sort()
-            sampled_idx = chain.from_iterable(self.windows[i] for i in sampled_windows)
+            sampled_idx = sorted(chain.from_iterable(self.windows[i] for i in sampled_windows))
             requests_gen = (self.sample.requests[i] for i in sampled_idx)
             sampled_requests = np.fromiter(requests_gen, dtype=self.sample.requests.dtype).view(np.recarray)
 
-            s = Sample(sampled_requests, beginning=self.sample.beginning, end=self.sample.end, traffic_boost=1/traffic_ratio)
+            s = Sample(sampled_requests,
+                       beginning=self.sample.beginning,
+                       end=self.sample.beginning + duration_ratio * self.sample.duration,
+                       is_sorted=True,
+                       traffic_boost=1/traffic_ratio)
             yield s
 
 
@@ -190,12 +194,34 @@ class Sample:
 
         if n_windows not in self.sample_generators:
             windows, n_empty = self.get_windows(prec_window_size, n_windows)
+            win2, n_empty2 = self.get_windows_old(prec_window_size, n_windows)
+            # assert len(windows) == len(win2), "Window-list lengths differ: {} vs. {} (prec_window_size: {})".format(len(windows), len(win2), prec_window_size)
+            # assert n_empty == n_empty2, "Number of empty windows differ: {} vs. {} (prec_window_size: {})".format(n_empty, n_empty2, prec_window_size)
             self.sample_generators[n_windows] = SampleGenerator(self, windows, n_empty)
         return self.sample_generators[n_windows](ratio)
 
     def get_windows(self, prec_window_size, n_windows):
-        groups = group_indices(self.requests.time, prec_window_size, self.beginning)
+        groups = group_indices(self.requests.time, prec_window_size, self.beginning)[1]
         return groups, n_windows - len(groups)
+
+    def get_windows_old(self, prec_window_size, n_windows):
+        t = self.requests.time
+        windows = []
+        idx_last = 0
+        num_requests = 0
+        n_empty = 0
+        for i_window in range(1, n_windows + 1):
+            idx_included = np.searchsorted(t[idx_last:] , self.beginning + i_window * prec_window_size, "right")
+            if idx_included == 0:
+                n_empty += 1
+            else:
+                windows.append(np.arange(idx_last, idx_last + idx_included))
+                idx_last += idx_included
+                num_requests += len(windows[-1])
+        assert num_requests == len(t)
+        assert n_windows == len(windows) + n_empty
+
+        return windows, n_empty
 
     def samples(self, n_samples, window_size, ratio):
         """Generate a list of bootstrap samples.
@@ -248,9 +274,17 @@ class Sample:
         ----------
         other : Sample
         """
-        self.requests = np.concatenate((self.requests, other.requests)).view(np.recarray)
-        self.beginning = min(self.beginning, other.beginning)
-        self.end = max(self.end, other.end)
+        if other.end <= self.beginning:
+            self.requests = np.concatenate((other.requests, self.requests)).view(np.recarray)
+            self.beginning = other.beginning
+        elif self.end <= other.beginning:
+            self.requests = np.concatenate((other.requests, self.requests)).view(np.recarray)
+            self.end = other.end
+        else:
+            self.requests = np.concatenate((self.requests, other.requests)).view(np.recarray)
+            self.requests.sort(order="time")
+            self.beginning = min(self.beginning, other.beginning)
+            self.end = max(self.end, other.end)
         self.__min_distances.clear()
         self.sample_generators.clear()
 
@@ -458,7 +492,6 @@ class MinMixin:
     def combine_evaluated_metrics(self, evaluated):
         return evaluated.min()
 
-
 class OneMinusMaxMixin:
     def combine_evaluated_metrics(self, evaluated):
         return 1.0 - evaluated.max()
@@ -467,7 +500,37 @@ class GeometricMeanMixin:
     def combine_evaluated_metrics(self, evaluated):
         return np.power(np.prod(evaluated), 1.0 / len(evaluated))
 
-
 class ArithmeticMeanCombineMixin:
     def combine_evaluated_metrics(self, evaluated):
         return evaluated.mean()
+
+
+class PvalueReference:
+    bs_sample_size = 500
+    def __init__(self, history, metric_estimator):
+        self.history = history
+        self.metric_estimator = metric_estimator
+        self.cdf_cache = {}
+
+    def get_cdfs(self, duration_ratio):
+        if duration_ratio not in self.cdf_cache:
+            samples = self.history.samples(self.bs_sample_size, 1 / len(self.history), duration_ratio)
+            metric_bs_data = tuple(np.empty(self.bs_sample_size) for _ in self.metric_estimator.directions)
+            for i, s in enumerate(samples):
+                for j, m in enumerate(self.metric_estimator(s)):
+                    metric_bs_data[j][i] = m
+
+            self.cdf_cache[duration_ratio] = tuple(
+                MetricCDF(md, d, r) for md, d, r in zip(metric_bs_data,
+                                                        self.metric_estimator.directions,
+                                                        self.metric_estimator.ranges))
+        return self.cdf_cache[duration_ratio]
+
+    def p_values(self, sample):
+        metrics = self.metric_estimator(sample)
+        cdfs = self.get_cdfs(sample.duration / self.history.duration)
+        return tuple(1-cdf(m) for cdf, m in zip(cdfs, metrics))
+
+    def update(self, sample):
+        self.history.merge(sample)
+        self.cdf_cache.clear()
