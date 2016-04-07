@@ -146,7 +146,7 @@ class Sample:
 
         self.beginning = beginning
         self.end = end
-        self.traffic_boost=1.0
+        self.traffic_boost = traffic_boost
 
         self.__min_distances = {}
         self.sample_generators = {}
@@ -194,7 +194,7 @@ class Sample:
 
         if n_windows not in self.sample_generators:
             windows, n_empty = self.get_windows(prec_window_size, n_windows)
-            win2, n_empty2 = self.get_windows_old(prec_window_size, n_windows)
+            # win2, n_empty2 = self.get_windows_old(prec_window_size, n_windows)
             # assert len(windows) == len(win2), "Window-list lengths differ: {} vs. {} (prec_window_size: {})".format(len(windows), len(win2), prec_window_size)
             # assert n_empty == n_empty2, "Number of empty windows differ: {} vs. {} (prec_window_size: {})".format(n_empty, n_empty2, prec_window_size)
             self.sample_generators[n_windows] = SampleGenerator(self, windows, n_empty)
